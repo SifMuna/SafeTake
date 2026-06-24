@@ -19,7 +19,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
@@ -57,7 +61,15 @@ class MediaRepository(private val context: Context) {
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val _items = MutableStateFlow<List<MediaItem>>(emptyList())
-    val items: StateFlow<List<MediaItem>> = _items
+
+    // Ids hidden by an in-flight, undoable delete: gone from [items] right away, but
+    // the files survive until the delete is committed (see requestDelete/commitDelete).
+    private val _pendingDelete = MutableStateFlow<Set<String>>(emptySet())
+
+    /** The visible library: loaded items minus anything in an in-flight (undoable) delete. */
+    val items: StateFlow<List<MediaItem>> =
+        combine(_items, _pendingDelete) { all, pending -> all.filterNot { it.id in pending } }
+            .stateIn(ioScope, SharingStarted.Eagerly, emptyList())
 
     // ~32 MB of decrypted thumbnails so grid scrolling doesn't re-decrypt; dropped on lock.
     private val thumbCache = object : android.util.LruCache<String, Bitmap>(32 * 1024 * 1024) {
@@ -95,6 +107,9 @@ class MediaRepository(private val context: Context) {
 
     fun clearLoaded() {
         _items.value = emptyList()
+        // Locking abandons any uncommitted delete; the items are still on disk and
+        // reappear on the next unlock.
+        _pendingDelete.value = emptySet()
         thumbCache.evictAll()
     }
 
@@ -248,14 +263,34 @@ class MediaRepository(private val context: Context) {
         return PlaybackFile(out, isTemp = true)
     }
 
-    fun delete(ids: Collection<String>) {
-        ids.forEach { id ->
-            mediaFile(id, encrypted = true).delete()
-            mediaFile(id, encrypted = false).delete()
-            thumbFile(id, encrypted = true).delete()
-            thumbFile(id, encrypted = false).delete()
+    // ---- deletion (undoable) ----
+    // Three phases so the UI can offer an Undo snackbar: requestDelete hides the
+    // items, then either undoDelete brings them back or commitDelete erases them.
+
+    /** Hides [ids] from [items] immediately. Reversible via [undoDelete] until [commitDelete]. */
+    fun requestDelete(ids: Set<String>) {
+        _pendingDelete.update { it + ids }
+    }
+
+    /** Cancels a pending delete — the items reappear in [items]. */
+    fun undoDelete(ids: Set<String>) {
+        _pendingDelete.update { it - ids }
+    }
+
+    /** Permanently erases [ids] (files + index). Runs on [ioScope] so it finishes even if the UI is gone. */
+    fun commitDelete(ids: Set<String>) {
+        ioScope.launch {
+            runCatching {
+                ids.forEach { id ->
+                    mediaFile(id, encrypted = true).delete()
+                    mediaFile(id, encrypted = false).delete()
+                    thumbFile(id, encrypted = true).delete()
+                    thumbFile(id, encrypted = false).delete()
+                }
+                saveIndex(_items.value.filterNot { it.id in ids })
+            }
+            _pendingDelete.update { it - ids }
         }
-        saveIndex(_items.value.filterNot { it.id in ids })
     }
 
     fun find(id: String): MediaItem? = _items.value.find { it.id == id }

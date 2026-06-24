@@ -2,11 +2,7 @@
 
 A private, PIN-locked camera and gallery app for Android. Photos and videos
 never touch shared storage: they are captured (or received via the share sheet)
-and stored inside the app's own data container, optionally encrypted at rest.
-
-This file is the entry point for both humans and AI coding assistants — read it
-before diving into source. It explains the security model, the module layout, and
-the non-obvious invariants that the code depends on.
+and stored inside the app's own data container.
 
 ## Security model
 
@@ -65,14 +61,17 @@ the non-obvious invariants that the code depends on.
   - `BiometricVault.kt` — optional biometric door: DEK wrapped by a
     biometric-gated Keystore key in `biometric.properties`. `encryptCipher` /
     `storeWrappedDek` to enable, `decryptCipher` / `recoverDek` to unlock.
-  - `VaultCipher.kt` — file format: `STVAULT1` magic + 12-byte IV + GCM stream.
+  - `VaultCipher.kt` — `STVAULT2` chunked AES-GCM file format (see its KDoc);
+    still reads legacy single-stream `STVAULT1` files.
   - `SessionVault.kt` — holds the unwrapped DEK in memory; `lock()` drops it and
     notifies listeners. Source of truth for the `unlocked` state.
 - `data/`
   - `MediaRepository.kt` — encrypted media, thumbs, and index under `filesDir`.
     `savePhotoAsync` / `saveVideoAsync` run captures on a process-lifetime
     `ioScope` so a long encrypt finishes even if the camera screen is torn down.
-    Still reads legacy plaintext `.raw` items via each item's `encrypted` flag.
+    Deletion is undoable in three phases — `requestDelete` (hide from `items`),
+    `undoDelete`, `commitDelete` (erase files on `ioScope`) — backing the Undo
+    snackbar. Still reads legacy plaintext `.raw` items via each `encrypted` flag.
   - `Prefs.kt` — non-secret policy (credential *shape*, show-PIN-length). Plain
     SharedPreferences; never stores the secret itself.
 - `share/` — `DecryptingProvider` (share-out content provider), `ShareOut`
@@ -121,6 +120,10 @@ adb shell run-as app.safetake sh -c 'xxd files/media/*.enc | head -2'
   seconds; if that work runs on a screen's `rememberCoroutineScope` it's cancelled
   when the user leaves the camera, silently dropping the save. Always route saves
   through `MediaRepository`'s `ioScope` (`savePhotoAsync` / `saveVideoAsync`).
+- **Delete is an Undo snackbar, not a dialog.** The `SnackbarHostState` and the
+  request→commit/undo logic live in `SafeTakeNav` (nav level), not in a screen, so
+  a delete started in the viewer survives the pop back to the gallery and stays
+  interactive. Locking abandons any uncommitted delete (items reappear next unlock).
 - `BiometricPrompt` requires a `FragmentActivity`; that's why `MainActivity`
   extends it. Reach the activity from Compose via `Context.findFragmentActivity()`.
   Note: `androidx.biometric:1.1.0` drags in an ancient `androidx.fragment:1.2.5`
